@@ -34,9 +34,21 @@ public class CustomTransportChannel extends AbstractGrpcWebChannel {
     protected Transport createTransport(final String method, final URL url, final TransportCallbacks callbacks) {
         final GrpcTransportOptions options = new GrpcTransportOptions();
         options.url = url;
+        final boolean[] sawHeaders = {false};
         options.onChunk = callbacks::onChunk;
-        options.onEnd = callbacks::onEnd;
+        options.onEnd = error -> {
+            if (!sawHeaders[0]) {
+                // The stream ended before any response headers arrived, e.g. the connection could not be established
+                // or was severed mid-handshake. The channel derives the closing Status from the received headers and
+                // fails if none were ever delivered, which would prevent the close from being reported to the caller
+                // at all - deliver synthetic empty headers first so the call closes cleanly as UNAVAILABLE (HTTP 503).
+                sawHeaders[0] = true;
+                callbacks.onHeaders(503, Js.uncheckedCast(JsPropertyMap.of()));
+            }
+            callbacks.onEnd(error);
+        };
         options.onHeaders = (headers, status) -> {
+            sawHeaders[0] = true;
             // normalize the headers union values to a string
             final JsPropertyMap<String> h = JsPropertyMap.of();
             final JsArray<String> keys = JsObject.keys(headers);
