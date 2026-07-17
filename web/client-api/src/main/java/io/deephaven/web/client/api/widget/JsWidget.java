@@ -28,7 +28,7 @@ import io.deephaven.web.client.api.Callbacks;
 import io.deephaven.web.client.api.ServerObject;
 import io.deephaven.web.client.api.WorkerConnection;
 import io.deephaven.web.client.api.barrage.stream.BiDiStream;
-import io.deephaven.web.client.api.event.HasEventHandling;
+import io.deephaven.web.client.api.lifecycle.HasLifecycle;
 import jsinterop.annotations.JsMethod;
 import jsinterop.annotations.JsOptional;
 import jsinterop.annotations.JsNullable;
@@ -46,10 +46,10 @@ import java.util.function.Supplier;
  * A Widget represents a server side object that sends one or more responses to the client. The client can then
  * interpret these responses to see what to render, or how to respond.
  * <p>
- * Most custom object types result in a single response being sent to the client, often with other exported objects, but
- * some will have streamed responses, and allow the client to send follow-up requests of its own. This class's API is
- * backwards compatible, but as such does not offer a way to tell the difference between a streaming or non-streaming
- * object type, the client code that handles the payloads is expected to know what to expect. See
+ * Most custom object types result in a single response being sent to the client (often with other exported objects),
+ * but some will have streamed responses, and allow the client to send follow-up requests of its own. This class's API
+ * is backward compatible, and as such does not offer a way to tell the difference between a streaming or non-streaming
+ * object type. The client code that handles the payloads is expected to know what to expect. See
  * {@link WidgetMessageDetails} for more information.
  * <p>
  * When the promise that returns this object resolves, it will have the first response assigned to its fields. Later
@@ -59,11 +59,11 @@ import java.util.function.Supplier;
  * remote messages are still pending - it is up to implementations of plugins to handle this case.
  * <p>
  * Also like WebSockets, the plugin API doesn't define how to serialize messages, and just handles any binary payloads.
- * What it does handle however, is allowing those messages to include references to server-side objects with those
+ * What it does handle, however, is allowing those messages to include references to server-side objects with those
  * payloads. Those server side objects might be tables or other built-in types in the Deephaven JS API, or could be
  * objects usable through their own plugins. They also might have no plugin at all, allowing the client to hold a
  * reference to them and pass them back to the server, either to the current plugin instance, or through another API.
- * The {@code Widget} type does not specify how those objects should be used or their lifecycle, but leaves that
+ * The {@link JsWidget} type does not specify how those objects should be used or their lifecycle, but leaves that
  * entirely to the plugin. Messages will arrive in the order they were sent.
  * <p>
  * This can suggest several patterns for how plugins operate:
@@ -79,12 +79,12 @@ import java.util.function.Supplier;
  * before bidirectional plugins were implemented. Another example of this is plugins that serve as a "factory", giving
  * the user access to table manipulation/creation methods not supported by gRPC or the JS API.</li>
  * <li>The plugin provides reference to Tables and other objects that only make sense within the context of the widget
- * instance, so when the widget goes away, those objects should be released as well. This is also an example of
+ * instance. When the widget goes away, those objects should be released as well. This is also an example of
  * {@link io.deephaven.web.client.api.JsPartitionedTable}, as the partitioned table tracks creation of new keys through
  * an internal table instance.</li>
  * </ul>
  *
- * Handling server objects in messages also has more than one potential pattern that can be used:
+ * There are also multiple potential patterns for handling server objects in messages:
  * <ul>
  * <li>One object per message - the message clearly is about that object, no other details required.</li>
  * <li>Objects indexed within their message - as each message comes with a list of objects, those objects can be
@@ -97,11 +97,22 @@ import java.util.function.Supplier;
  * without the server somehow signaling that it will never reference that export again.</li>
  * </ul>
  */
-// TODO consider reconnect support? This is somewhat tricky without understanding the semantics of the widget
 @TsName(namespace = "dh", name = "Widget")
-public class JsWidget extends HasEventHandling implements ServerObject, WidgetMessageDetails {
+public class JsWidget extends HasLifecycle implements ServerObject, WidgetMessageDetails {
+    /**
+     * Fired when a new message is received from the server.
+     * <p>
+     * {@code event.detail} is an {@link EventDetails} instance containing the message payload and any exported objects
+     * included with the message.
+     */
     @JsProperty(namespace = "dh.Widget")
     public static final String EVENT_MESSAGE = "message";
+
+    /**
+     * Fired when the widget's message stream is closed, either because the server is finished sending messages, or
+     * because an error occurred, server shut down, session closed, etc. Plugins should specify their own close message
+     * if required.
+     */
     @JsProperty(namespace = "dh.Widget")
     public static final String EVENT_CLOSE = "close";
 
@@ -109,6 +120,12 @@ public class JsWidget extends HasEventHandling implements ServerObject, WidgetMe
     private final TypedTicket typedTicket;
 
     private boolean hasFetched;
+
+    /**
+     * Set when the connection reports this widget as disconnected, cleared when a same-session revive (via
+     * {@link #reconnect()}) succeeds. While set, the next initial response re-announces the widget to consumers.
+     */
+    private boolean awaitingRevive;
 
     private final Supplier<BiDiStream<StreamRequest, StreamResponse>> streamFactory;
     private BiDiStream<StreamRequest, StreamResponse> messageStream;
@@ -134,6 +151,26 @@ public class JsWidget extends HasEventHandling implements ServerObject, WidgetMe
         return connection;
     }
 
+    /**
+     * Marks this as a standalone, independently-reconnectable widget and registers it with the connection so it is
+     * revived on reconnect. Called only for widgets handed directly to the caller - widgets wrapped by a figure / tree
+     * / partitioned-table are revived by their owner and must not be registered here (that would double-revive them).
+     */
+    public Promise<JsWidget> markReconnectable() {
+        connection.registerSimpleReconnectable(this);
+        return Promise.resolve(this);
+    }
+
+    /**
+     * A failed revive means this widget will never reconnect, so stop tracking it as reconnectable (mirroring
+     * {@link #close()}); otherwise it keeps receiving disconnect/refetch calls on every future reconnect.
+     */
+    @Override
+    public void die(Object error) {
+        connection.unregisterSimpleReconnectable(this);
+        super.die(error);
+    }
+
     private void closeStream() {
         if (messageStream != null) {
             messageStream.end();
@@ -148,11 +185,63 @@ public class JsWidget extends HasEventHandling implements ServerObject, WidgetMe
     @JsMethod
     public void close() {
         suppressEvents();
+        connection.unregisterSimpleReconnectable(this);
         closeStream();
         connection.releaseTicket(getTicket());
     }
 
+    /**
+     * Opens (or reopens) the message stream using the widget's current ticket. Used for the initial fetch. When invoked
+     * as the connection's new-session revive hook, the export ticket is no longer valid and the server-side object may
+     * differ, so we cannot safely reconnect - the revive fails.
+     */
+    @Override
     public Promise<JsWidget> refetch() {
+        if (!awaitingRevive) {
+            // initial fetch, or an internal caller deliberately rebinding the stream
+            return openStream();
+        }
+        // A new session was created: the old export ticket is invalid and the object may differ. Fail the revive
+        // rather than silently reconnect to a different object.
+        IllegalStateException failure = new IllegalStateException("Cannot revive widget: a new session was created");
+        die(failure);
+        return (Promise<JsWidget>) (Promise) Promise.reject(failure);
+    }
+
+    /**
+     * Same-session reconnect: the export ticket is still valid, so reopen the message stream with the same ticket and
+     * re-announce to consumers on success. If the stream cannot be reopened, fail the revive.
+     */
+    @Override
+    public void reconnect() {
+        openStream().then(widget -> {
+            announceReconnect();
+            return Promise.resolve(widget);
+        }, failure -> {
+            die(failure);
+            return (Promise<JsWidget>) (Promise) Promise.reject(failure);
+        }).catch_(ignore -> {
+            // failure was already reported via die()
+            return null;
+        });
+    }
+
+    @Override
+    public void disconnected() {
+        awaitingRevive = true;
+        closeStream();
+        super.disconnected();
+    }
+
+    private void announceReconnect() {
+        awaitingRevive = false;
+        // unsuppress events and fire the reconnect event first, then re-deliver the fresh initial response as a
+        // message so that consumers re-render from the server's current state
+        super.reconnect();
+        fireEvent(EVENT_MESSAGE, new EventDetails(response.getData(), exportedObjects));
+    }
+
+    private Promise<JsWidget> openStream() {
         closeStream();
         return new Promise<>((resolve, reject) -> {
             exportedObjects = new JsArray<>();
@@ -182,7 +271,11 @@ public class JsWidget extends HasEventHandling implements ServerObject, WidgetMe
                     reject.onInvoke(status.getDescription());
                 }
                 DomGlobal.setTimeout(ignore -> {
-                    fireEvent(EVENT_CLOSE);
+                    // Skip the close event on a transport failure while the whole connection is down - the
+                    // connection's lifecycle (disconnected/reconnect/refetch) owns this widget's state instead.
+                    if (status.isOk() || connection.isConnected()) {
+                        fireEvent(EVENT_CLOSE);
+                    }
                 }, 0);
                 closeStream();
             });
